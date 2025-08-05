@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:14
+    container_name: om-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: om_user
+      POSTGRES_PASSWORD: om_pass
+      POSTGRES_DB: openmemory
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U om_user -d openmemory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redislabs/redisearch:2.8.6
+    container_name: om-redis
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    # Passwordless for local dev; REDIS_URL will omit auth. If you want auth, tell me to enable requirepass.
+    command: ["redis-server","--appendonly","yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD","redis-cli","ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5
+    container_name: om-neo4j
+    ports:
+      - "7474:7474"   # HTTP UI
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_dbms_security_auth__minimum__password__length: "4"
+      NEO4J_dbms_default__listen__address: "0.0.0.0"
+      NEO4J_dbms_default__advertised__address: "localhost"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL","cypher-shell -u neo4j -p password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+volumes:
+  pg_data:
+  redis_data:
+  neo4j_data:
+  neo4j_logs:

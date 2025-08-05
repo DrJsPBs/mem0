@@ -1,0 +1,2 @@
+CREATE CONSTRAINT user_id  IF NOT EXISTS FOR (u:User)   REQUIRE u.user_id   IS UNIQUE;
+CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.memory_id IS UNIQUE; 

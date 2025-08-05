@@ -1,8 +1,10 @@
 import unittest
 from unittest.mock import MagicMock, patch
+
 import pytest
-from mem0.graphs.neptune.main import MemoryGraph
+
 from mem0.graphs.neptune.base import NeptuneBase
+from mem0.graphs.neptune.main import MemoryGraph
 
 
 class TestNeptuneMemory(unittest.TestCase):

@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import socket
+from functools import lru_cache
 
 from app.database import SessionLocal
 from app.models import Config as ConfigModel
@@ -133,34 +134,28 @@ def reset_memory_client():
     _config_hash = None
 
 
+
+
+@lru_cache
 def get_default_memory_config():
-    """Get default memory client configuration with sensible defaults."""
     return {
         "vector_store": {
-            "provider": "qdrant",
+            "provider": "redis",
             "config": {
-                "collection_name": "openmemory",
-                "host": "mem0_store",
-                "port": 6333,
+                "redis_url": os.getenv("REDIS_URL"),
+                "collection_name": os.getenv("REDIS_COLLECTION_NAME", "openmemory_vectors"),
+                "embedding_model_dims": 1536,
+                "distance_metric": "COSINE"
             }
         },
-        "llm": {
-            "provider": "openai",
+        "graph_store": {
+            "provider": "neo4j",
             "config": {
-                "model": "gpt-4o-mini",
-                "temperature": 0.1,
-                "max_tokens": 2000,
-                "api_key": "env:OPENAI_API_KEY"
+                "url": os.getenv("NEO4J_URI"),
+                "username": os.getenv("NEO4J_USERNAME"),
+                "password": os.getenv("NEO4J_PASSWORD")
             }
-        },
-        "embedder": {
-            "provider": "openai",
-            "config": {
-                "model": "text-embedding-3-small",
-                "api_key": "env:OPENAI_API_KEY"
-            }
-        },
-        "version": "v1.1"
+        }
     }
 
 
