@@ -48,7 +48,7 @@ services:
     labels:
       - 'traefik.enable=true'
       - 'traefik.docker.network=traefik'
-      - 'traefik.http.routers.openmemory-api.rule=Host(`fullmem.onemainarmy.com`)'
+      - 'traefik.http.routers.openmemory-api.rule=Host(`fullmem.drjlabs.com`)'
       - 'traefik.http.routers.openmemory-api.entrypoints=websecure'
       - 'traefik.http.routers.openmemory-api.tls=true'
       - 'traefik.http.services.openmemory-api.loadbalancer.server.port=8765'

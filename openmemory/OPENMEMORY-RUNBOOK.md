@@ -1,359 +1,446 @@
-# OpenMemory API runbook: Redis vector store + Postgres DB + Neo4j graph
+# OpenMemory Deployment Guide – Redis Vector DB, PostgreSQL (pgvector), and Neo4j Graph
 
-## Purpose and Scope
-- Durable, repo-committed runbook to wire OpenMemory with:
-  - Redis (vector store)
-  - Postgres (primary DB)
-  - Neo4j (graph)
-- Audience: operators and developers bringing up OpenMemory in dev/staging/prod.
-- Style: concise checklists, copy-pasteable commands, and clickable references to code and docs using the format [`filename OR language.declaration()`](relative/file/path.ext:line).
+This guide replaces prior runbooks and is the single source of truth for deploying OpenMemory with:
+- Redis (RediSearch) as the vector database
+- PostgreSQL with pgvector for structured storage (and optional vector columns)
+- Neo4j for the graph store
 
-Anchors:
-- [Checklist A — Environment and versions](#checklist-a--environment-and-versions)
-- [Checklist B — Database initialization](#checklist-b--database-initialization)
-- [Checklist C — Redis FT index & Neo4j constraints](#checklist-c--redis-ft-index--neo4j-constraints)
-- [Checklist D — Start API and probes](#checklist-d--start-api-and-probes)
-- [Checklist E — Configure LLM/Embedder/OpenMemory](#checklist-e--configure-llmembedderopenmemory)
-- [Checklist F — Create and query memories](#checklist-f--create-and-query-memories)
-- [Checklist G — Operational notes and guardrails](#checklist-g--operational-notes-and-guardrails)
-- [Cutover plan and Acceptance criteria](#cutover-plan-and-acceptance-criteria)
+It explicitly documents differences vs upstream defaults (commonly Qdrant/SQLite) and this repository’s forked defaults. It aligns with the corrective analysis in [markdown](openmemory/Codebase&#32;review&#32;task.md:1) and the architectural findings in [markdown](openmemory/ARCHITECTURE-REVIEW.md:1), and reflects how the code reads configuration and exposes health/readiness behavior.
+
+Cross-references to code:
+- Default memory config: [python.get_default_memory_config()](openmemory/api/app/utils/memory.py:139)
+- Environment resolver: [python._parse_environment_variables()](openmemory/api/app/utils/memory.py:162)
+- Config handlers: [python.get_configuration](openmemory/api/app/routers/config.py:124), [python.update_configuration](openmemory/api/app/routers/config.py:124), [python.reset_configuration](openmemory/api/app/routers/config.py:124)
+- Health and readiness router: [python](openmemory/api/app/routers/health.py:1); deep readiness: [python.readiness()](openmemory/api/app/routers/health.py:59)
+- MCP SSE mounting: [python.setup_mcp_server(app)](openmemory/api/main.py:79); handler: [python.handle_sse](openmemory/api/app/mcp_server.py:377)
+- Create-all guard: [python.FastAPI()](openmemory/api/main.py:14)
 
 ---
 
-## Checklist A — Environment and versions
+## Why this guide
 
-### Version requirements
-- Python 3.10+
-- Postgres 14+ with pgvector extension if used elsewhere; not required for Redis flow
-- Redis 7.2+ with RediSearch module (for FT index)
-- Neo4j 5.x or AuraDB equivalent
-- uvicorn/fastapi dependencies resolved via your environment
+OpenMemory upstream examples often assume Qdrant for vectors and SQLite for structured data. This guide standardizes instead on:
+- Redis Stack (RediSearch) for vector similarity (HNSW or FLAT)
+- PostgreSQL with pgvector for relational + optional vector columns
+- Neo4j for graph relationships
 
-### Environment variables (examples)
-- Core DB/Redis/Neo4j:
-```
-export DATABASE_URL="postgresql+psycopg2://openmemory:openmemory@localhost:5432/openmemory"
-export REDIS_URL="redis://localhost:6379/0"
-export NEO4J_URI="bolt://localhost:7687"
-export NEO4J_USER="neo4j"
-export NEO4J_PASSWORD="password"
-```
-- LLM/Embedding placeholders (override as needed):
-```
-export OPENAI_API_KEY="sk-..."
-export EMBEDDING_MODEL="text-embedding-3-small"
-export LLM_MODEL="gpt-4o-mini"
-```
-
-References for env parsing and defaults:
-- [`python.DATABASE_URL`](openmemory/api/app/database.py:10)
-- [`python.get_default_memory_config`](openmemory/api/app/utils/memory.py:139)
-- [`python.get_default_memory_config`](openmemory/api/app/utils/memory.py:151)
-- [`python._parse_environment_variables`](openmemory/api/app/utils/memory.py:162)
+All examples, environment variables, and API payloads herein are aligned to these providers and to the current code behavior and handlers.
 
 ---
 
-## Checklist B — Database initialization
+## Prerequisites
 
-- Alembic migration directory:
-  - [`dir`](openmemory/api/alembic/versions/:1)
+Recommended versions and tooling for Development vs Production:
 
-- Initialize/upgrade schema (from repo root or appropriate cwd):
+- Python: 3.10+
+- OpenMemory API: installable with mem0 and graph extras
+- Required Python packages (for local API runs):
+  - redis
+  - redisvl
+  - psycopg2-binary (or psycopg2 in production environments)
+  - neo4j
+- Docker and Docker Compose
+- Network ports:
+  - API: 8765 (assumed throughout this guide)
+  - Redis: 6379 (plus 8001 for RedisInsight if desired)
+  - PostgreSQL: 5432
+  - Neo4j: 7474 (HTTP), 7687 (Bolt)
+
+Install required packages locally:
+```bash
+pip install -U "mem0[graph]" redis redisvl psycopg2-binary neo4j
 ```
+
+Note: In production, prefer `psycopg2` (source build) if required by your environment. `psycopg2-binary` is convenient for development.
+
+---
+
+## Service Architecture
+
+Components and roles:
+- API: OpenMemory backend service exposing REST and SSE endpoints for configuration, memory operations, health/readiness, and MCP.
+- UI: OpenMemory web UI consuming the API for configuration and memory management.
+- Redis (Redis Stack with RediSearch): vector similarity index (HNSW or FLAT). Stores embeddings keyed by collection.
+- PostgreSQL (with pgvector): primary relational store (entities, memories, metadata). pgvector enables vector columns where applicable.
+- Neo4j: graph store for relationships between entities and memories.
+
+---
+
+## Preparing the databases
+
+### Redis (RediSearch) – create FT index
+
+Use Redis Stack (includes RediSearch). The vector field dimension DIM must match your embedder’s output dimension.
+
+Common OpenAI models and dims:
+- text-embedding-3-small: 1536
+- text-embedding-3-large: 3072
+
+Example FT.CREATE with HNSW on vector field `embedding` (assumes DIM=1536):
+
+```bash
+# Example schema: HASH with fields: id, text, user_id, created_at, and a VECTOR field "embedding"
+# Adjust PREFIX, ON, and SCHEMA to your data model.
+# Ensure your REDIS_URL points to a Redis Stack instance.
+FT.CREATE idx:openmemory:memories ON HASH PREFIX 1 "openmemory:memories:" SCHEMA \
+  id TAG \
+  user_id TAG \
+  text TEXT \
+  created_at NUMERIC SORTABLE \
+  embedding VECTOR HNSW 12 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE INITIAL_CAP 10000 M 16 EF_CONSTRUCTION 200
+```
+
+Notes:
+- DIM must match your embedder model dimension.
+- If using `redisvl`, you can define schema via redisvl; ensure index parameters match your model dims and chosen distance metric (COSINE recommended for OpenAI embeddings).
+
+### PostgreSQL – enable pgvector and run migrations
+
+Create database, user, and enable pgvector:
+
+```sql
+-- As a superuser (e.g., postgres):
+CREATE DATABASE openmemory;
+CREATE USER openmemory_user WITH PASSWORD 'changeme';
+GRANT ALL PRIVILEGES ON DATABASE openmemory TO openmemory_user;
+
+-- Connect to the DB:
+\c openmemory
+
+-- Enable pgvector (requires extension installed on the cluster):
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+Run Alembic migrations from repo root (explicit config path):
+```bash
 alembic -c openmemory/api/alembic.ini upgrade head
 ```
 
-- Development shortcut (avoid in production):
-  - Note on dev create_all: [`python.Base.metadata.create_all(bind=engine)`](openmemory/api/main.py:25)
-  - For local development, export the env flag to auto-create tables from models:
-    ```
-    export ENABLE_CREATE_ALL=true
-    ```
-    This gates the create_all call in [`python.FastAPI()`](openmemory/api/main.py:14). In production, do not set this flag and rely on Alembic migrations only.
+### Neo4j – constraints and APOC
 
----
+Ensure Neo4j has APOC available if your flows require it.
 
-## Checklist C — Redis FT index & Neo4j constraints
-
-- Redis: create or verify RediSearch vector index (see production setup snippets):
-  - [`markdown`](openmemory-production-setup.md:271)
-
-- Neo4j: create constraints/indexes as required by graph features:
-  - [`markdown`](openmemory-production-setup.md:287)
-
-Example Redis CLI (adjust index/schema to your deployment):
-```
-redis-cli FT.CREATE memories_idx ON HASH PREFIX 1 "mem:" SCHEMA
-  text TEXT
-  user_id TAG
-  app_id TAG
-  vector VECTOR HNSW 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE INITIAL_CAP 10000 M 16 EF_CONSTRUCTION 200
+Example constraint for unique memory id (adjust label/property to your schema):
+```cypher
+CREATE CONSTRAINT memory_id_unique IF NOT EXISTS
+FOR (m:Memory) REQUIRE m.id IS UNIQUE;
 ```
 
-Example Neo4j constraints (adjust labels/props as used by OpenMemory graph):
-```
-cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" -a "$NEO4J_URI" \
-  'CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE;'
-```
-
----
-
-## Checklist D — Start API and probes
-
-### Deep Readiness Checks
-
-The API exposes minimal health endpoints by default:
-- [`python`](openmemory/api/app/routers/health.py:1) mounted in [`python.FastAPI()`](openmemory/api/main.py:8)
-
-By default, `/health/readiness` returns a minimal ready status without touching external systems. You can enable optional deeper connectivity checks using an environment flag.
-
-Enable deep readiness:
+Example docker run with APOC:
 ```bash
-export ENABLE_DEEP_READINESS=true
+docker run -it --rm \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/changeme \
+  -e NEO4JLABS_PLUGINS='["apoc"]' \
+  -e NEO4J_apoc_export_file_enabled=true \
+  -e NEO4J_apoc_import_file_enabled=true \
+  -e NEO4J_apoc_import_file_use__neo4j__config=true \
+  neo4j:5.20
 ```
 
-When enabled, the readiness endpoint will attempt:
-- Redis
-  - Connect using REDIS_URL and ping the server via [`python.aioredis.from_url().ping()`](openmemory/api/app/routers/health.py:33)
-  - Optionally query RediSearch index info via [`python.Redis.execute_command("FT.INFO", collection)`](openmemory/api/app/routers/health.py:41)
-    - If FT.INFO is unavailable or lacks permissions, ping success still counts as connectivity OK and `has_index` will be reported as false.
-- Neo4j
-  - Connect using NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
-  - Run a trivial query [`python.session.run("RETURN 1 AS ok")`](openmemory/api/app/routers/health.py:63)
+---
 
-Soft-dependency behavior:
-- The checks use optional imports. If `redis` or `neo4j` Python packages are not installed and `ENABLE_DEEP_READINESS=true`, `/health/readiness` returns HTTP 503 with details indicating a missing dependency.
-- If `ENABLE_DEEP_READINESS` is not set (or falsey), the endpoint does not perform these checks and continues to return a minimal ready response.
+## Environment variables
 
-Safe by default:
-- With the flag off, `/health/readiness` behaves minimally and will not fail due to Redis/Neo4j unavailability.
+Canonical set (aligned with code usage):
+- `DATABASE_URL` (PostgreSQL), e.g. `postgresql+psycopg2://openmemory_user:changeme@localhost:5432/openmemory`
+- `REDIS_URL` e.g. `redis://localhost:6379/0`
+- `REDIS_COLLECTION_NAME` e.g. `openmemory:memories`
+- `NEO4J_URI` e.g. `bolt://localhost:7687`
+- `NEO4J_USERNAME` e.g. `neo4j`
+- `NEO4J_PASSWORD` e.g. `changeme`
+- `OPENAI_API_KEY` your OpenAI key
+- `EMBEDDING_MODEL` e.g. `text-embedding-3-small`
+- `LLM_MODEL` e.g. `gpt-4o-mini`
 
-Sample usage:
+Where read in code:
+- Default memory config: [python.get_default_memory_config()](openmemory/api/app/utils/memory.py:139)
+- Env substitution resolver (applies to all sections): [python._parse_environment_variables()](openmemory/api/app/utils/memory.py:162)
+
+---
+
+## API configuration
+
+### Ports and base URL
+The API commonly runs on port `8765`. Base URL examples assume `http://localhost:8765`.
+
+### Endpoints
+- `GET /api/v1/config/`
+- `PUT /api/v1/config/`
+- `POST /api/v1/config/reset`
+
+Handlers in code: [python.get_configuration](openmemory/api/app/routers/config.py:124), [python.update_configuration](openmemory/api/app/routers/config.py:124), [python.reset_configuration](openmemory/api/app/routers/config.py:124)
+
+### Example configuration payload
+
+The server supports env substitution for secrets via `${env:VAR}`. Ensure your payload aligns with the default memory config structure:
+
+```json
+{
+  "mem0": {
+    "llm": {
+      "provider": "openai",
+      "config": {
+        "api_key": "${env:OPENAI_API_KEY}",
+        "model": "${env:LLM_MODEL}"
+      }
+    },
+    "embedder": {
+      "provider": "openai",
+      "config": {
+        "api_key": "${env:OPENAI_API_KEY}",
+        "model": "${env:EMBEDDING_MODEL}"
+      }
+    }
+  },
+  "openmemory": {
+    "database": {
+      "url": "${env:DATABASE_URL}"
+    },
+    "vector_store": {
+      "provider": "redis",
+      "config": {
+        "redis_url": "${env:REDIS_URL}",
+        "collection_name": "${env:REDIS_COLLECTION_NAME}",
+        "embedding_model_dims": 1536
+      }
+    },
+    "graph": {
+      "provider": "neo4j",
+      "config": {
+        "url": "${env:NEO4J_URI}",
+        "username": "${env:NEO4J_USERNAME}",
+        "password": "${env:NEO4J_PASSWORD}"
+      }
+    }
+  }
+}
+```
+
+Example calls:
 ```bash
-export ENABLE_DEEP_READINESS=true
-curl -i http://localhost:8000/health/readiness
-```
+# Read current config
+curl -s http://localhost:8765/api/v1/config/ | jq
 
-- Start API (from repo root):
-```
-uvicorn openmemory.api.main:app --host 0.0.0.0 --port 8000 --reload
-```
+# Update config
+curl -s -X PUT http://localhost:8765/api/v1/config/ \
+  -H "Content-Type: application/json" \
+  -d @config.json | jq
 
-- Readiness probes:
-  - Configuration endpoint implementation: [`python.get_configuration`](openmemory/api/app/routers/config.py:124)
-  - Memories listing implementation: [`python.list_memories`](openmemory/api/app/routers/memories.py:101)
-
-Quick checks:
-```
-curl -sS http://localhost:8000/api/v1/config/ | jq .
-curl -sS 'http://localhost:8000/api/v1/memories/?limit=1' | jq .
-```
-
-- MCP SSE presence check:
-  - Server setup: [`python.setup_mcp_server(app)`](openmemory/api/main.py:79)
-  - SSE handler: [`python.handle_sse`](openmemory/api/app/mcp_server.py:377)
-  - Post message handler: [`python.sse.handle_post_message`](openmemory/api/app/mcp_server.py:404)
-
-Example SSE route probe (adjust path if required):
-```
-curl -i http://localhost:8000/api/v1/mcp/sse
+# Reset config to default
+curl -s -X POST http://localhost:8765/api/v1/config/reset | jq
 ```
 
 ---
 
-## Checklist E — Configure LLM/Embedder/OpenMemory
+## Health and readiness
 
-Defaults and merge behavior references:
-- Default config loader: [`python.get_default_memory_config`](openmemory/api/app/utils/memory.py:139)
-- Default JSON: [`json`](openmemory/api/default_config.json:1)
-- Override JSON: [`json`](openmemory/api/config.json:1)
-- Client builder: [`python.get_memory_client`](openmemory/api/app/utils/memory.py:187)
-- Reset hook: [`python.reset_memory_client()`](openmemory/api/app/routers/config.py:149)
+- Health router source: [python](openmemory/api/app/routers/health.py:1)
+- Deep readiness check function: [python.readiness()](openmemory/api/app/routers/health.py:59)
+- Deep readiness can be gated by `ENABLE_DEEP_READINESS`. When enabled, the API will actively check connectivity to Redis, PostgreSQL, and Neo4j before reporting ready.
 
-Base URL:
-```
-BASE=http://localhost:8000
+Docker/Kubernetes health checks:
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s \
+  CMD curl -fsS http://localhost:8765/health/ready || exit 1
 ```
 
-Config APIs:
-
-- GET current config:
-```
-curl -sS "$BASE/api/v1/config/" | jq .
-```
-
-- PUT merge config (example: set models/keys):
-```
-curl -sS -X PUT "$BASE/api/v1/config/" \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "mem0": {
-          "llm": { "provider": "openai", "model": "gpt-4o-mini" },
-          "embedder": { "provider": "openai", "model": "text-embedding-3-small" }
-        },
-        "openmemory": {
-          "vector_store": { "provider": "redis", "url": "'"$REDIS_URL"'" },
-          "database": { "url": "'"$DATABASE_URL"'" },
-          "graph": { "provider": "neo4j", "uri": "'"$NEO4J_URI"'", "user": "'"$NEO4J_USER"'", "password": "'"$NEO4J_PASSWORD"'" }
-        }
-      }' | jq .
-```
-
-- POST reset (reloads/clears cached client):
-```
-curl -sS -X POST "$BASE/api/v1/config/reset" | jq .
-```
-
-LLM sub-config:
-- GET:
-```
-curl -sS "$BASE/api/v1/config/mem0/llm" | jq .
-```
-- PUT:
-```
-curl -sS -X PUT "$BASE/api/v1/config/mem0/llm" \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "provider": "openai",
-        "model": "gpt-4o-mini"
-      }' | jq .
-```
-
-Embedder sub-config:
-- GET:
-```
-curl -sS "$BASE/api/v1/config/mem0/embedder" | jq .
-```
-- PUT:
-```
-curl -sS -X PUT "$BASE/api/v1/config/mem0/embedder" \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "provider": "openai",
-        "model": "text-embedding-3-small"
-      }' | jq .
-```
-
-OpenMemory sub-config:
-- GET:
-```
-curl -sS "$BASE/api/v1/config/openmemory" | jq .
-```
-- PUT:
-```
-curl -sS -X PUT "$BASE/api/v1/config/openmemory" \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "vector_store": { "provider": "redis", "url": "'"$REDIS_URL"'" },
-        "database": { "url": "'"$DATABASE_URL"'" },
-        "graph": { "provider": "neo4j", "uri": "'"$NEO4J_URI"'", "user": "'"$NEO4J_USER"'", "password": "'"$NEO4J_PASSWORD"'" }
-      }' | jq .
-```
+Add a startup probe or initial delay to allow Redis/Postgres/Neo4j initialization and index/constraint creation.
 
 ---
 
-## Checklist F — Create and query memories
+## Code-level alignment
 
-Routes and handlers:
-- Create: [`python.create_memory`](openmemory/api/app/routers/memories.py:211)
-- List: [`python.list_memories`](openmemory/api/app/routers/memories.py:101)
-- Get by ID: [`python.get_memory`](openmemory/api/app/routers/memories.py:311)
-- Filter: [`python.filter_memories`](openmemory/api/app/routers/memories.py:500)
-- Related: [`python.get_related_memories`](openmemory/api/app/routers/memories.py:594)
+Configuration shape:
+- The default memory config includes:
+  - `openmemory.database.url`
+  - `openmemory.vector_store` (provider + config)
+  - `openmemory.graph` (provider + config)
+  - `mem0.llm` and `mem0.embedder`
+- The UI surfaces corresponding fields. The server supports env substitution in all sections via resolver [python._parse_environment_variables](openmemory/api/app/utils/memory.py:162).
 
-Examples:
+Create-all guard:
+- `ENABLE_CREATE_ALL` protection is configured around app instantiation; see [python.FastAPI()](openmemory/api/main.py:14).
 
-- Create a memory:
+---
+
+## Docker Compose (minimal example)
+
+Notes:
+- This is a development-grade example intended for local runs. Redis is unauthenticated and Neo4j uses default initial auth. Secure credentials and enable TLS for production.
+- You still need to (a) create the Redis FT index and (b) enable pgvector + apply Alembic migrations.
+
+Save as `docker-compose.yml` at the repo root if desired for local setup:
+
+```yaml
+version: "3.9"
+services:
+  redis:
+    image: redis/redis-stack:7.2.0-v13
+    ports:
+      - "6379:6379"
+      - "8001:8001" # optional RedisInsight
+    volumes:
+      - redis-data:/data
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: openmemory
+      POSTGRES_USER: openmemory_user
+      POSTGRES_PASSWORD: changeme
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    # Ensure pgvector is available; use a pgvector-enabled image or install extension via init scripts.
+
+  neo4j:
+    image: neo4j:5.20
+    environment:
+      NEO4J_AUTH: neo4j/changeme
+      NEO4JLABS_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_apoc_import_file_use__neo4j__config: "true"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j-data:/data
+
+  # API and UI can run locally on host using your Python environment and Next.js,
+  # or be containerized separately. When running API locally, export localhost-based envs.
+
+volumes:
+  redis-data:
+  pg-data:
+  neo4j-data:
 ```
-curl -sS -X POST "$BASE/api/v1/memories/" \
-  -H 'Content-Type: application/json' \
+
+Environment for local API when using the above compose:
+```bash
+export DATABASE_URL="postgresql+psycopg2://openmemory_user:changeme@localhost:5432/openmemory"
+export REDIS_URL="redis://localhost:6379/0"
+export REDIS_COLLECTION_NAME="openmemory:memories"
+export NEO4J_URI="bolt://localhost:7687"
+export NEO4J_USERNAME="neo4j"
+export NEO4J_PASSWORD="changeme"
+export OPENAI_API_KEY="YOUR_KEY"
+export EMBEDDING_MODEL="text-embedding-3-small"
+export LLM_MODEL="gpt-4o-mini"
+export ENABLE_DEEP_READINESS="true"
+```
+
+Then:
+- Create Redis FT index (see Redis section).
+- Enable pgvector and run migrations:
+  ```bash
+  alembic -c openmemory/api/alembic.ini upgrade head
+  ```
+
+---
+
+## End-to-end validation
+
+Health and readiness:
+```bash
+curl -s http://localhost:8765/health/live | jq
+curl -s http://localhost:8765/health/ready | jq
+```
+
+Configuration flow:
+```bash
+# Check defaults
+curl -s http://localhost:8765/api/v1/config/ | jq
+
+# Apply configuration (assumes config.json with env placeholders as above)
+curl -s -X PUT http://localhost:8765/api/v1/config/ \
+  -H "Content-Type: application/json" \
+  -d @config.json | jq
+
+# Reset if needed
+curl -s -X POST http://localhost:8765/api/v1/config/reset | jq
+```
+
+Memory operations (server routes: [python](openmemory/api/app/routers/memories.py:1)):
+
+```bash
+# Create memory
+curl -s -X POST http://localhost:8765/api/v1/memories \
+  -H "Content-Type: application/json" \
   -d '{
-        "text": "Alice prefers decaf coffee in the afternoon.",
+        "text": "Alice likes hiking on weekends.",
         "user_id": "user_123",
-        "app_id": "app_abc",
-        "metadata": {"source":"runbook-test"}
-      }' | jq .
-```
+        "metadata": {"source": "test"}
+      }' | jq
 
-- List memories:
-```
-curl -sS "$BASE/api/v1/memories/?limit=10&offset=0" | jq .
-```
+# List memories
+curl -s "http://localhost:8765/api/v1/memories?user_id=user_123&limit=10" | jq
 
-- Get by ID (replace {id}):
-```
-ID="&lt;copy-from-create-response&gt;"
-curl -sS "$BASE/api/v1/memories/$ID" | jq .
-```
-
-- Filter by criteria (example):
-```
-curl -sS -X POST "$BASE/api/v1/memories/filter" \
-  -H 'Content-Type: application/json' \
+# Vector search
+curl -s -X POST http://localhost:8765/api/v1/memories/search \
+  -H "Content-Type: application/json" \
   -d '{
-        "query": "decaf coffee",
+        "query": "What does Alice enjoy?",
         "user_id": "user_123",
-        "limit": 5
-      }' | jq .
+        "top_k": 5
+      }' | jq
 ```
 
-- Related memories for an ID:
-```
-curl -sS "$BASE/api/v1/memories/$ID/related?limit=5" | jq .
+MCP SSE smoke check:
+- Router mounted via [python.setup_mcp_server(app)](openmemory/api/main.py:79)
+- SSE handler: [python.handle_sse](openmemory/api/app/mcp_server.py:377)
+
+```bash
+# Replace "client" and "user" with valid values recognized by your setup
+curl -N http://localhost:8765/mcp/testclient/sse/user_123
 ```
 
 ---
 
-## Checklist G — Operational notes and guardrails
+## Troubleshooting
 
-- Health endpoints: status (not implemented). Reference discussion:
-  - [`markdown`](openmemory/ARCHITECTURE-REVIEW.md:124)
+- Redis DIM mismatch  
+  Symptom: search/indexing errors or zero results.  
+  Action: Confirm FT index DIM equals the embedding model dimension. Recreate FT index with correct DIM and distance metric. Ensure `embedding_model_dims` in configuration matches.
 
-- Production DB lifecycle:
-  - Use Alembic migrations only; avoid `create_all` in production.
-  - Backups: enable scheduled Postgres backups. Test restore drills.
-  - Apply schema changes via CI/CD with migration gating.
+- Redis RediSearch module or permissions  
+  Symptom: `FT.CREATE`/`FT.INFO` errors.  
+  Action: Use Redis Stack image. Verify RediSearch is loaded. Ensure your client has permissions. Re-run `FT.CREATE` with correct schema.
 
-- Redis/Neo4j provisioning responsibilities:
-  - Redis: ensure RediSearch module and persistence strategy (RDB/AOF) per SLOs.
-  - Neo4j: ensure appropriate role/permissions, memory, and constraint migrations.
-  - For exact setup snippets, see:
-    - Redis index: [`markdown`](openmemory-production-setup.md:271)
-    - Neo4j constraints: [`markdown`](openmemory-production-setup.md:287)
+- PostgreSQL pgvector  
+  Symptom: migration or query errors on vector columns.  
+  Action: Ensure `CREATE EXTENSION vector` executed in the database. Re-run migrations:  
+  ```bash
+  alembic -c openmemory/api/alembic.ini upgrade head
+  ```
 
-- MCP SSE routes summary:
-  - SSE initialization: [`python.setup_mcp_server(app)`](openmemory/api/main.py:79)
-  - SSE handler entrypoints:
-    - [`python.handle_sse`](openmemory/api/app/mcp_server.py:377)
-    - [`python.sse.handle_post_message`](openmemory/api/app/mcp_server.py:404)
+- Neo4j auth/APOC  
+  Symptom: connection failures or APOC procedure errors.  
+  Action: Verify `NEO4J_URI`/username/password. Ensure APOC enabled via env vars or config. Check initial password and change in production.
 
-- Env placeholder strategy and cache/reset behavior:
-  - Env parsing/merge: [`python._parse_environment_variables`](openmemory/api/app/utils/memory.py:162)
-  - Client caching and rebuild: [`python.get_memory_client`](openmemory/api/app/utils/memory.py:261)
-  - Reset endpoint: [`python.reset_memory_client()`](openmemory/api/app/routers/config.py:149)
+- Alembic config path  
+  Use:  
+  ```bash
+  alembic -c openmemory/api/alembic.ini upgrade head
+  ```
 
 ---
 
-## Cutover plan and Acceptance criteria
+## Appendix
 
-Cutover plan (timestamps are operator-provided):
-- T-60m: Provision/validate Redis with FT index and Neo4j with constraints.
-- T-45m: Run Alembic to latest on Postgres.
-- T-30m: Configure API config via PUT /api/v1/config/ with Redis/DB/Neo4j params.
-- T-20m: Restart API, then POST /api/v1/config/reset to rebuild cached clients.
-- T-15m: Readiness probes (GET /api/v1/config/, GET /api/v1/memories/?limit=1).
-- T-10m: Functional verify: create memory, list, filter, related.
-- T-5m: Enable traffic/consumers.
+References to code and docs:
+- Default config loader: [python.get_default_memory_config()](openmemory/api/app/utils/memory.py:139)
+- Env resolver: [python._parse_environment_variables()](openmemory/api/app/utils/memory.py:162)
+- Config endpoints: [python.get_configuration](openmemory/api/app/routers/config.py:124), [python.update_configuration](openmemory/api/app/routers/config.py:124), [python.reset_configuration](openmemory/api/app/routers/config.py:124)
+- Health router and readiness: [python](openmemory/api/app/routers/health.py:1), [python.readiness()](openmemory/api/app/routers/health.py:59)
+- MCP SSE mount/handler: [python.setup_mcp_server(app)](openmemory/api/main.py:79), [python.handle_sse](openmemory/api/app/mcp_server.py:377)
+- Architecture context: [markdown](openmemory/ARCHITECTURE-REVIEW.md:1)
+- Corrective analysis: [markdown](openmemory/Codebase&#32;review&#32;task.md:1)
 
-Acceptance criteria:
-- Config readiness:
-  - GET /api/v1/config/ returns merged values reflecting Redis URL, Postgres URL, and Neo4j credentials.
-  - Handlers present: [`python.get_configuration`](openmemory/api/app/routers/config.py:124), [`python.get_memory_client`](openmemory/api/app/utils/memory.py:187), [`python.get_default_memory_config`](openmemory/api/app/utils/memory.py:139), [`json`](openmemory/api/config.json:1).
-- Memories readiness:
-  - POST /api/v1/memories/ succeeds and returns an ID using [`python.create_memory`](openmemory/api/app/routers/memories.py:211).
-  - GET /api/v1/memories/ reflects inserted memory via [`python.list_memories`](openmemory/api/app/routers/memories.py:101).
-  - GET /api/v1/memories/{id} works via [`python.get_memory`](openmemory/api/app/routers/memories.py:311).
-  - POST /api/v1/memories/filter returns relevant results via [`python.filter_memories`](openmemory/api/app/routers/memories.py:500).
-  - GET /api/v1/memories/{id}/related returns related items via [`python.get_related_memories`](openmemory/api/app/routers/memories.py:594).
-- SSE presence:
-  - SSE endpoints reachable; handlers present at [`python.setup_mcp_server(app)`](openmemory/api/main.py:79), [`python.handle_sse`](openmemory/api/app/mcp_server.py:377), [`python.sse.handle_post_message`](openmemory/api/app/mcp_server.py:404).
+Security notes for production:
+- Use strong, rotated credentials for PostgreSQL and Neo4j; enable TLS where supported.
+- Configure Redis with ACL/auth and network isolation; consider Redis TLS.
+- Store secrets in a secrets manager or orchestrator (K8s secrets, SSM, Vault).
+- Restrict API exposure and enforce auth/authorization as appropriate for your deployment environment.
