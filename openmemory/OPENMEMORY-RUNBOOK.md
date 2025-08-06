@@ -111,10 +111,27 @@ GRANT ALL PRIVILEGES ON DATABASE openmemory TO openmemory_user;
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-Run Alembic migrations from repo root (explicit config path):
+Run Alembic migrations:
+- From repo root on host:
 ```bash
 alembic -c openmemory/api/alembic.ini upgrade head
 ```
+- From inside the API container (discovered config path):
+```bash
+docker compose -f openmemory/docker-compose.yml exec -T openmemory-api sh -lc '
+  cd /usr/src/openmemory && alembic -c alembic.ini upgrade head
+'
+```
+
+If using pgvector as the vector store
+- Configure `openmemory.vector_store.provider: "pgvector"` and supply connection details (user, password, host, port, dbname).
+- Typical options include `collection_name` and `embedding_model_dims` (e.g., 1536).
+- Advanced options such as `diskann` and `hnsw` may be available depending on the Mem0 pgvector backend; consult provider docs before enabling.
+
+If using pgvector as the vector store
+- Configure `openmemory.vector_store.provider: "pgvector"` and supply connection details (user, password, host, port, dbname).
+- Typical options include `collection_name` and `embedding_model_dims` (e.g., 1536).
+- Advanced options such as `diskann` and `hnsw` may be available depending on the Mem0 pgvector backend; consult provider docs before enabling.
 
 ### Neo4j – constraints and APOC
 
@@ -131,7 +148,9 @@ Example docker run with APOC:
 docker run -it --rm \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=neo4j/changeme \
+  # Depending on the image version, one of these is accepted:
   -e NEO4JLABS_PLUGINS='["apoc"]' \
+  # or: -e NEO4J_PLUGINS='["apoc"]' \
   -e NEO4J_apoc_export_file_enabled=true \
   -e NEO4J_apoc_import_file_enabled=true \
   -e NEO4J_apoc_import_file_use__neo4j__config=true \
@@ -144,14 +163,17 @@ docker run -it --rm \
 
 Canonical set (aligned with code usage):
 - `DATABASE_URL` (PostgreSQL), e.g. `postgresql+psycopg2://openmemory_user:changeme@localhost:5432/openmemory`
-- `REDIS_URL` e.g. `redis://localhost:6379/0`
-- `REDIS_COLLECTION_NAME` e.g. `openmemory:memories`
+- `REDIS_URL` e.g. `redis://localhost:6379/0` or with password `redis://:your_redis_password@localhost:6379/0`
+- `REDIS_COLLECTION_NAME` e.g. `openmemory:memories` (commonly `openmemory_vectors` in examples)
 - `NEO4J_URI` e.g. `bolt://localhost:7687`
 - `NEO4J_USERNAME` e.g. `neo4j`
 - `NEO4J_PASSWORD` e.g. `changeme`
 - `OPENAI_API_KEY` your OpenAI key
 - `EMBEDDING_MODEL` e.g. `text-embedding-3-small`
 - `LLM_MODEL` e.g. `gpt-4o-mini`
+
+Env placeholder syntax:
+- The server resolves environment placeholders using the form `${env:VAR_NAME}` (with `${}` and `env:`). Examples below use this exact syntax. Strings like `env:VAR_NAME` without `${}` will not be resolved.
 
 Where read in code:
 - Default memory config: [python.get_default_memory_config()](openmemory/api/app/utils/memory.py:139)
@@ -173,7 +195,7 @@ Handlers in code: [python.get_configuration](openmemory/api/app/routers/config.p
 
 ### Example configuration payload
 
-The server supports env substitution for secrets via `${env:VAR}`. Ensure your payload aligns with the default memory config structure:
+The server supports env substitution for secrets via the exact syntax `${env:VAR}` (must include `${}` and `env:`). Ensure your payload aligns with the default memory config structure:
 
 ```json
 {
@@ -217,6 +239,12 @@ The server supports env substitution for secrets via `${env:VAR}`. Ensure your p
 }
 ```
 
+If using PostgreSQL (pgvector) as the vector store instead of Redis, set `provider` to `"pgvector"` and supply provider-specific options (refer to Mem0 docs). Common options include:
+- `dbname` (default often `postgres`)
+- `collection_name` (default often `mem0`)
+- `embedding_model_dims` (e.g., 1536)
+- Advanced: `diskann` and `hnsw` toggles (implementation-dependent)
+
 Example calls:
 ```bash
 # Read current config
@@ -246,6 +274,10 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=30s \
 ```
 
 Add a startup probe or initial delay to allow Redis/Postgres/Neo4j initialization and index/constraint creation.
+
+Implementation note (current progress):
+- Fixed DSN crash caused by unconditionally passing SQLite-only `check_same_thread` to SQLAlchemy for all backends. Now only applied when `DATABASE_URL` starts with `sqlite`. Code location: [python](openmemory/api/app/database.py:14).
+- Discovered Alembic config path inside container: `/usr/src/openmemory/alembic.ini`. Use this path when running migrations from the API container.
 
 ---
 
@@ -299,6 +331,10 @@ services:
     image: neo4j:5.20
     environment:
       NEO4J_AUTH: neo4j/changeme
+      # Depending on image version use one of the following:
+      # NEO4JLABS_PLUGINS: '["apoc"]'
+      # or
+      # NEO4J_PLUGINS: '["apoc"]'
       NEO4JLABS_PLUGINS: '["apoc"]'
       NEO4J_apoc_export_file_enabled: "true"
       NEO4J_apoc_import_file_enabled: "true"
@@ -321,8 +357,8 @@ volumes:
 Environment for local API when using the above compose:
 ```bash
 export DATABASE_URL="postgresql+psycopg2://openmemory_user:changeme@localhost:5432/openmemory"
-export REDIS_URL="redis://localhost:6379/0"
-export REDIS_COLLECTION_NAME="openmemory:memories"
+export REDIS_URL="redis://:your_redis_password@localhost:6379/0"
+export REDIS_COLLECTION_NAME="openmemory_vectors"
 export NEO4J_URI="bolt://localhost:7687"
 export NEO4J_USERNAME="neo4j"
 export NEO4J_PASSWORD="changeme"
@@ -338,6 +374,83 @@ Then:
   ```bash
   alembic -c openmemory/api/alembic.ini upgrade head
   ```
+
+### Docker Compose (full stack example including API and UI)
+
+This example adds the OpenMemory API and UI containers for a complete local stack.
+
+```yaml
+version: '3.9'
+services:
+  redis:
+    image: redis/redis-stack:7.2.0-v13
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_ARGS=--requirepass your_redis_password
+
+  postgres:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=openmemory
+      - POSTGRES_USER=openmemory_user
+      - POSTGRES_PASSWORD=changeme
+    ports:
+      - "5432:5432"
+
+  neo4j:
+    image: neo4j:5.20
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      # Use the appropriate variable for your image version
+      NEO4JLABS_PLUGINS: '["apoc"]'
+      # or: NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_AUTH: neo4j/changeme
+
+  openmemory-api:
+    build:
+      context: ./openmemory/api
+      dockerfile: Dockerfile
+    ports:
+      - "8765:8765"
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://openmemory_user:changeme@postgres:5432/openmemory
+      - REDIS_URL=redis://:your_redis_password@redis:6379/0
+      - REDIS_COLLECTION_NAME=openmemory_vectors
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=changeme
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=gpt-4o-mini
+      - EMBEDDING_MODEL=text-embedding-3-small
+      - ENABLE_DEEP_READINESS=true
+    depends_on:
+      - redis
+      - postgres
+      - neo4j
+
+  openmemory-ui:
+    build:
+      context: ./openmemory/ui
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8765
+      - NEXT_PUBLIC_USER_ID=drj
+    depends_on:
+      - openmemory-api
+```
+
+After `docker compose up -d`, follow:
+- Create the Redis FT index (or verify it matches your embedding dims).
+- Run Alembic migrations:
+  ```bash
+  alembic -c openmemory/api/alembic.ini upgrade head
+  ```
+- Set configuration via the API and reset if needed (see Configuration flow).
 
 ---
 
